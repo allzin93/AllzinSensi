@@ -1,0 +1,373 @@
+name: gerar-apk
+on: [push, workflow_dispatch]
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Montar projeto
+        run: |
+          mkdir -p app/src/main/java/ai/allzin/sensi app/src/main/assets
+          cat > settings.gradle <<'ARQ'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "AllzinSensi"
+          include ":app"
+          ARQ
+          cat > build.gradle <<'ARQ'
+          plugins {
+              id 'com.android.application' version '8.5.2' apply false
+              id 'org.jetbrains.kotlin.android' version '1.9.24' apply false
+          }
+          ARQ
+          cat > gradle.properties <<'ARQ'
+          org.gradle.jvmargs=-Xmx2048m
+          android.useAndroidX=true
+          ARQ
+          cat > app/build.gradle <<'ARQ'
+          plugins { id 'com.android.application'; id 'org.jetbrains.kotlin.android' }
+          android {
+              namespace 'ai.allzin.sensi'
+              compileSdk 34
+              defaultConfig {
+                  applicationId 'ai.allzin.sensi'
+                  minSdk 26
+                  targetSdk 34
+                  versionCode 1
+                  versionName '1.0'
+              }
+              compileOptions { sourceCompatibility JavaVersion.VERSION_17; targetCompatibility JavaVersion.VERSION_17 }
+              kotlinOptions { jvmTarget = '17' }
+          }
+          ARQ
+          cat > app/src/main/AndroidManifest.xml <<'ARQ'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW"/>
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE"/>
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+              <application android:label="Allzin Sensi"
+                  android:icon="@android:drawable/ic_menu_compass"
+                  android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+                  <activity android:name=".MainActivity" android:exported="true"
+                      android:configChanges="orientation|screenSize|keyboardHidden">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN"/>
+                          <category android:name="android.intent.category.LAUNCHER"/>
+                      </intent-filter>
+                  </activity>
+                  <service android:name=".OverlayService" android:exported="false"
+                      android:foregroundServiceType="specialUse">
+                      <property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                          android:value="crosshair_overlay"/>
+                  </service>
+              </application>
+          </manifest>
+          ARQ
+          cat > app/src/main/java/ai/allzin/sensi/MainActivity.kt <<'ARQ'
+          package ai.allzin.sensi
+
+          import android.app.Activity
+          import android.content.Intent
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.util.DisplayMetrics
+          import android.view.ViewGroup
+          import android.webkit.JavascriptInterface
+          import android.webkit.WebView
+          import android.webkit.WebViewClient
+          import org.json.JSONObject
+
+          class MainActivity : Activity() {
+              private lateinit var web: WebView
+
+              override fun onCreate(s: Bundle?) {
+                  super.onCreate(s)
+                  web = WebView(this)
+                  setContentView(web, ViewGroup.LayoutParams(-1, -1))
+                  with(web.settings) {
+                      javaScriptEnabled = true
+                      domStorageEnabled = true
+                      allowFileAccess = true
+                  }
+                  web.webViewClient = WebViewClient()
+                  web.addJavascriptInterface(Bridge(), "AllzinNative")
+                  web.loadUrl("file:///android_asset/index.html")
+              }
+
+              private fun diagonal(): Double {
+                  val m = DisplayMetrics()
+                  windowManager.defaultDisplay.getRealMetrics(m)
+                  val inch = Math.hypot(m.widthPixels.toDouble(), m.heightPixels.toDouble()) / m.xdpi
+                  return if (inch in 3.0..13.0) inch else 6.5
+              }
+
+              inner class Bridge {
+                  @JavascriptInterface
+                  fun deviceInfo(): String {
+                      val m = DisplayMetrics()
+                      windowManager.defaultDisplay.getRealMetrics(m)
+                      val am = getSystemService(ACTIVITY_SERVICE) as android.app.ActivityManager
+                      val mi = android.app.ActivityManager.MemoryInfo()
+                      am.getMemoryInfo(mi)
+                      val j = JSONObject()
+                      j.put("model", Build.MODEL ?: "desconhecido")
+                      j.put("brand", Build.MANUFACTURER ?: "")
+                      j.put("w", m.widthPixels)
+                      j.put("h", m.heightPixels)
+                      j.put("ppi", m.xdpi.toDouble())
+                      j.put("diagonal", diagonal())
+                      j.put("hz", windowManager.defaultDisplay.refreshRate.toDouble())
+                      j.put("cores", Runtime.getRuntime().availableProcessors())
+                      j.put("ramGb", mi.totalMem / 1073741824.0)
+                      j.put("smallestWidth", resources.configuration.smallestScreenWidthDp)
+                      j.put("android", Build.VERSION.RELEASE ?: "")
+                      return j.toString()
+                  }
+
+                  @JavascriptInterface
+                  fun canOverlay(): Boolean = Settings.canDrawOverlays(this@MainActivity)
+
+                  @JavascriptInterface
+                  fun askOverlay() {
+                      startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                          Uri.parse("package:$packageName")))
+                  }
+
+                  @JavascriptInterface
+                  fun showCrosshair(json: String) = send("SHOW", json)
+                  @JavascriptInterface
+                  fun updateCrosshair(json: String) = send("UPDATE", json)
+                  @JavascriptInterface
+                  fun hideCrosshair() = send("HIDE", "")
+
+                  private fun send(a: String, json: String) {
+                      val i = Intent(this@MainActivity, OverlayService::class.java)
+                      i.action = a
+                      i.putExtra("json", json)
+                      startForegroundService(i)
+                  }
+              }
+          }
+          ARQ
+          cat > app/src/main/java/ai/allzin/sensi/OverlayService.kt <<'ARQ'
+          package ai.allzin.sensi
+
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.Service
+          import android.content.Intent
+          import android.graphics.Canvas
+          import android.graphics.Color
+          import android.graphics.Paint
+          import android.graphics.PixelFormat
+          import android.os.IBinder
+          import android.view.Gravity
+          import android.view.View
+          import android.view.WindowManager
+          import org.json.JSONObject
+          import kotlin.math.max
+          import kotlin.math.min
+
+          class OverlayService : Service() {
+              private lateinit var wm: WindowManager
+              private var view: CrosshairView? = null
+              private var cfg = Cfg()
+
+              data class Cfg(
+                  var shape: String = "cross",
+                  var sizeMm: Float = 2.2f,
+                  var thickMm: Float = 0.55f,
+                  var gapMm: Float = 1.4f,
+                  var color: Int = Color.parseColor("#22FF88"),
+                  var alpha: Int = 200
+              )
+
+              override fun onCreate() {
+                  super.onCreate()
+                  wm = getSystemService(WINDOW_SERVICE) as WindowManager
+                  val ch = NotificationChannel("cx", "Mira flutuante", NotificationManager.IMPORTANCE_LOW)
+                  (getSystemService(NOTIFICATION_SERVICE) as NotificationManager).createNotificationChannel(ch)
+                  val n = Notification.Builder(this, "cx")
+                      .setContentTitle("Allzin Sensi")
+                      .setContentText("Mira flutuante ativa")
+                      .setSmallIcon(android.R.drawable.ic_menu_compass)
+                      .build()
+                  startForeground(1, n)
+              }
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  val json = intent?.getStringExtra("json").orEmpty()
+                  when (intent?.action) {
+                      "SHOW" -> { parse(json); show() }
+                      "UPDATE" -> { parse(json); view?.invalidate() }
+                      "HIDE" -> { remove(); stopSelf() }
+                  }
+                  return START_STICKY
+              }
+
+              private fun parse(j: String) {
+                  if (j.isBlank()) return
+                  runCatching {
+                      val o = JSONObject(j)
+                      cfg.shape = o.optString("shape", cfg.shape)
+                      cfg.sizeMm = o.optDouble("size", cfg.sizeMm.toDouble()).toFloat()
+                      cfg.thickMm = o.optDouble("thick", cfg.thickMm.toDouble()).toFloat()
+                      cfg.gapMm = o.optDouble("gap", cfg.gapMm.toDouble()).toFloat()
+                      cfg.alpha = o.optInt("opacity", 80) * 255 / 100
+                      runCatching { cfg.color = Color.parseColor(o.optString("color", "#22FF88")) }
+                  }
+              }
+
+              private fun show() {
+                  if (view != null) return
+                  val v = CrosshairView()
+                  val p = WindowManager.LayoutParams(
+                      WindowManager.LayoutParams.WRAP_CONTENT,
+                      WindowManager.LayoutParams.WRAP_CONTENT,
+                      WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                          WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                          WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
+                          WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+                      PixelFormat.TRANSLUCENT
+                  )
+                  p.gravity = Gravity.CENTER
+                  wm.addView(v, p)
+                  view = v
+              }
+
+              private fun remove() {
+                  view?.let { runCatching { wm.removeView(it) } }
+                  view = null
+              }
+
+              override fun onDestroy() { remove(); super.onDestroy() }
+              override fun onBind(i: Intent?): IBinder? = null
+
+              private fun mm(v: Float): Float = v / 25.4f * resources.displayMetrics.xdpi
+
+              inner class CrosshairView : View(this@OverlayService) {
+                  override fun onMeasure(w: Int, h: Int) {
+                      val r = (max(mm(cfg.sizeMm) + mm(cfg.gapMm), mm(cfg.thickMm)) * 2f + mm(1f)).toInt()
+                      setMeasuredDimension(r, r)
+                  }
+
+                  override fun onDraw(c: Canvas) {
+                      val cx = width / 2f
+                      val cy = height / 2f
+                      val t = max(1f, mm(cfg.thickMm))
+                      val len = mm(cfg.sizeMm)
+                      val gap = mm(cfg.gapMm)
+                      val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                          color = cfg.color
+                          alpha = cfg.alpha
+                          style = Paint.Style.FILL
+                      }
+                      fun bar(x: Float, y: Float, w: Float, h: Float) = c.drawRect(x, y, x + w, y + h, paint)
+                      if (cfg.shape != "dot" && cfg.shape != "circle") {
+                          bar(cx - t / 2, cy - gap - len, t, len)
+                          bar(cx - t / 2, cy + gap, t, len)
+                          bar(cx - gap - len, cy - t / 2, len, t)
+                          if (cfg.shape != "t") bar(cx + gap, cy - t / 2, len, t)
+                      }
+                      if (cfg.shape == "dot" || cfg.shape == "dotgap") c.drawCircle(cx, cy, max(1.6f, t * 0.7f), paint)
+                      if (cfg.shape == "circle") {
+                          val s = Paint(paint).apply { style = Paint.Style.STROKE; strokeWidth = t }
+                          c.drawCircle(cx, cy, min(len, width / 2f - t), s)
+                      }
+                  }
+              }
+          }
+          ARQ
+          cat > app/src/main/assets/index.html <<'ARQ'
+          <!doctype html>
+          <html><head><meta charset="utf-8">
+          <meta name="viewport" content="width=device-width,initial-scale=1">
+          <title>Allzin Sensi</title>
+          <style>
+          *{box-sizing:border-box}
+          body{margin:0;padding:14px;background:#0e1110;color:#eef2ef;font-family:system-ui,sans-serif;font-size:13px}
+          h1{font-size:19px;font-weight:500;margin:0 0 3px}
+          .sub{font-size:11.5px;color:#8d9a92;margin:0 0 12px;line-height:1.45}
+          .tabs{display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin-bottom:12px}
+          .tabs button{font:inherit;font-size:11.5px;padding:9px 2px;border-radius:9px;border:1px solid #2a332d;background:transparent;color:#8d9a92}
+          .tabs button.on{background:#22c55e;border-color:#22c55e;color:#06120a;font-weight:500}
+          .panel{display:none}.panel.on{display:block}
+          .card{border:1px solid #2a332d;border-radius:12px;padding:12px;margin-bottom:10px;background:#151a17}
+          .card h3{font-size:12px;font-weight:500;margin:0 0 9px}
+          .row{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:6px 0;font-size:12.5px;border-bottom:1px dashed #2a332d}
+          .row:last-child{border-bottom:none}.row span:first-child{color:#8d9a92}
+          b{font-weight:500;font-variant-numeric:tabular-nums}
+          label{display:block;font-size:11px;color:#8d9a92;margin:9px 0 4px}
+          input,select{width:100%;font:inherit;font-size:12.5px;padding:8px 9px;border-radius:8px;border:1px solid #2a332d;background:#0e1110;color:#eef2ef}
+          .two{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+          .btn{width:100%;font:inherit;font-size:13px;font-weight:500;padding:11px;border-radius:10px;border:1px solid #22c55e;background:#22c55e;color:#06120a;margin-top:10px}
+          .btn.ghost{background:transparent;color:#eef2ef;border-color:#2a332d}
+          .btn.sm{font-size:12px;padding:8px}
+          .det{font-size:11px;color:#8d9a92;line-height:1.6;margin:6px 0 0;word-break:break-word}
+          .val{font-size:26px;font-weight:500;line-height:1.1}
+          .unit{font-size:11px;color:#8d9a92}
+          .grid2{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:10px}
+          .big{border:1px solid #2a332d;border-radius:12px;padding:11px;background:#1a211c}
+          .fine{display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px;margin-top:10px}
+          .fine button{font:inherit;font-size:12px;padding:8px 0;border-radius:8px;border:1px solid #2a332d;background:#0e1110;color:#eef2ef}
+          .note{font-size:11px;line-height:1.5;color:#8d9a92;margin:8px 0 0}
+          .badge{display:inline-block;font-size:10px;padding:3px 7px;border-radius:20px;border:1px solid #22c55e;color:#22c55e;margin-bottom:8px}
+          .bar{height:5px;border-radius:4px;background:#2a332d;overflow:hidden;width:60px}
+          .bar i{display:block;height:100%;background:#22c55e}
+          .prev{background:#050706;border-radius:12px;border:1px solid #2a332d;overflow:hidden;margin-bottom:9px}
+          canvas{display:block;width:100%}
+          .sw{display:flex;gap:6px;margin-top:4px}
+          .sw button{flex:1;height:26px;border-radius:7px;border:1px solid #2a332d}
+          .rng{display:grid;grid-template-columns:1fr 44px;gap:8px;align-items:center}
+          .rng output{font-size:11.5px;text-align:right;color:#8d9a92}
+          input[type=range]{padding:0;height:26px;accent-color:#22c55e;border:none;background:transparent}
+          .dot{width:6px;height:6px;border-radius:50%;background:#22c55e;display:inline-block;margin-right:5px}
+          </style></head><body>
+          <h1>Allzin Sensi</h1>
+          <p class="sub">Sensi, densidade, HUD e mira a partir do seu aparelho. Nada injeta código no jogo.</p>
+          <nav class="tabs">
+            <button data-t="perfil" class="on">Aparelho</button>
+            <button data-t="res">Resultado</button>
+            <button data-t="mira">Mira</button>
+            <button data-t="teste">Ajuste</button>
+          </nav>
+          <div class="panel on" id="p-perfil">
+            <div class="card"><h3><span class="dot"></span>Leitura do sistema</h3><p class="det" id="det">Lendo…</p></div>
+            <div class="card"><h3>Dados</h3>
+              <label>Modelo</label><input id="model">
+              <div class="two">
+                <div><label>Largura px</label><input id="resw" type="number" inputmode="numeric"></div>
+                <div><label>Altura px</label><input id="resh" type="number" inputmode="numeric"></div>
+              </div>
+              <label>Diagonal (polegadas)</label><input id="diag" type="number" step="0.01" inputmode="decimal">
+              <div class="two">
+                <div><label>Taxa de tela</label><select id="hz"><option value="60">60 Hz</option><option value="90">90 Hz</option><option value="120">120 Hz</option><option value="144">144 Hz</option></select></div>
+                <div><label>Faixa</label><select id="tier"><option value="low">Entrada</option><option value="mid">Intermediário</option><option value="high">Topo</option></select></div>
+              </div>
+              <div class="two">
+                <div><label>Garra</label><select id="fingers"><option value="2">2 dedos</option><option value="3">3 dedos</option><option value="4">4 dedos</option><option value="5">5 dedos</option></select></div>
+                <div><label>Estilo</label><select id="style"><option value="prec">Preciso</option><option value="bal">Equilibrado</option><option value="agg">Agressivo</option></select></div>
+              </div>
+              <label>Versão</label><select id="ver"><option value="ff">Free Fire</option><option value="max">Free Fire Max</option></select>
+              <button class="btn" id="calc">Calcular</button>
+            </div>
+          </div>
+          <div class="panel" id="p-res"><div id="resbox"><p class="note">Preencha e toque em calcular.</p></div></div>
+          <div class="panel" id="p-mira">
+            <div class="card"><h3>Prévia em tamanho real</h3>
+              <div class="prev"><canvas id="cv" width="380" height="230"></canvas></div>
+              <div class="row"><span>Formato</span><select id="shape" style="width:140px">
+                <option value="cross">Cruz</option><option value="dot">Ponto</option>
+                <option value="dotgap">Ponto + cruz</option><option value="circle">Círculo</option><option value="t">T</option>
+              </select></div>
+              <label>Comprimento (mm)</label><div class="rng"><input type="range" id="csize" min="0.6" max="6" step="0.1" value="2.2"><output id="o-csize">2.2</output></div>
+              <label>Espessura (mm)</
